@@ -1,298 +1,96 @@
 package main
 
 import (
+	"encoding/json"
+	"math"
+	//"net"
+	"os"
+	"sync"
+	"sync/atomic"
+	"time"
 
-	"errors"
+	//"errors"
 	"fmt"
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/go-xorm/xorm"
-	"github.com/go-xorm/core"
-	"os"
-	"strings"
-	"sync"
+	//"os"
+	"strconv"
+	//"strings"
+	//"sync"
+	//"sync/atomic"
+	//
+	//"math"
+	//"net"
+	//"time"
 
-	"math"
-	"net"
-
-	"time"
 
 	//"os"
 
+	model "model"
+
 )
-var XormEngine = &xorm.Engine{}
-
-
-type As_distribution_done struct {
-	Id           int `json:"id" xorm:"id int pk autoincr"`
-	Container_num int `json:"Container_num" xorm:"container_num int"`
-	Container_name string `json:"Container_name" xorm:"container_name varchar"`
-	Ip string `json:"ip" xorm:"ip varchar"`
-	Distribution_done int `json:"distribution_done" xorm:"distribution_done tinyint"`
-	Deployment_done int `json:"deployment_done" xorm:"deployment_done tinyint"`
-	Convergence_done int `json:"convergence_done" xorm:"convergence_done tinyint"`
-
-}
-type As_distribution_info struct {
-	Id           int `json:"id" xorm:"id int pk autoincr"`
-	Name string `json:"name" xorm:"name varchar"`
-	Tcp_port int `json:"tcp_port" xorm:"tcp_port int"`
-	Ip string `json:"ip" xorm:"ip varchar"`
-	In_degree int `json:"in_degree" xorm:"in_degree int"`
-	Out_degree int `json:"out_degree" xorm:"out_degree int"`
-	Container_name string `json:"Container_name" xorm:"container_name varchar"`
-}
-
-var AllPortMap map[string]int
-var AllIpMap map[string]string
-var globalServer chan int
 
 
 
-type BGP struct{
-    port int
-    name string
-    processDone chan bool
-    sendNum chan int
-    receiveNum chan int
-}
+var globalDeployServerNum int32
+var globalConnectServerNum int32
+var globalDoneServerNum  int32
+
+//var AllPortMap map[string]int
+//var AllIpMap map[string]string
+//var globalPeerInfo map[string]map[string]map[string]int
+//var globalSendPeerMap map[string][]string
 
 
-func (bgp *BGP) Start(wg *sync.WaitGroup)  {
-    wg.Add(1)
-    go bgp.ServerStart(wg)
-}
 
-func (bgp *BGP) DoServerStuff(conn net.Conn) {
-
-    buf := make([]byte, 512)
-    buf_len, err := conn.Read(buf)
-    if err != nil {
-        fmt.Println("Error reading", err.Error())
-        return
-    }
-    asPathContent := strings.Split(string(buf[:buf_len]),"|")
-
-    for index,value := range asPathContent{
-        if value == bgp.name {
-            //处理验证
-            receiveNum := <- bgp.receiveNum -1
-            bgp.receiveNum <- receiveNum
-            sendNum := <-bgp.sendNum
-
-                 //bgpsec
-             times := index + 2
-             //ASPA
-             //times := 1
-             //if index % 2 == 0{
-             //  times = 2
-             //}
-             time.Sleep(time.Duration(times*10)*time.Millisecond)
-
-
-            if index < len(asPathContent) - 1{
-                //处理发送-签名
-                //fmt.Println("------------------我是",bgp.name,"收到内容", string(buf[:buf_len]),"要发送",asPathContent[index+1],"端口号",AllPortMap[asPathContent[index+1]],
-                //	"ip:",AllIpMap[asPathContent[index+1]])
-                bgp.SendToPeer(AllIpMap[asPathContent[index+1]],AllPortMap[asPathContent[index+1]],string(buf[:buf_len]))
-                sendNum = sendNum -1
-            }else{
-                //fmt.Println("~~~~~~~~~~~~~~~~~~我是终点",bgp.name,"收到内容", string(buf[:buf_len]))
-            }
-            bgp.sendNum <- sendNum
-            if sendNum < 1 && receiveNum < 1{
-                bgp.processDone <- true
-             }
-
-            break
-        }
-    }
-    conn.Close()
-}
-func (bgp *BGP) ServerStart(wg *sync.WaitGroup)    {
-    defer wg.Done()
-    go bgp.ServerListen()
-    wg1 := &sync.WaitGroup{}
-    wg1.Add(1)
-    go bgp.CheckDone(wg1)
-    wg1.Wait()
-}
-
-func (bgp *BGP) CheckDone(wg *sync.WaitGroup)    {
-    defer wg.Done()
-    for{
-        value:= <-bgp.processDone
-        if value == true{
-            return
-        }
-    }
-}
-
-func (bgp *BGP) ServerListen()  {
-   address := fmt.Sprintf("0.0.0.0:%d", bgp.port)
-   listener, _ := net.Listen("tcp", address)
-   defer listener.Close()
-   //if err != nil {
-   //  fmt.Println("Error listening", err.Error())
-   //  return
-   //}
-   serverNum := <- globalServer + 1
-   globalServer <- serverNum
-   //fmt.Println("启动服务:",serverNum)
-   for {
-       //fmt.Printf("Pointer: %p\n", bgp)
-       conn, err := listener.Accept()
-       //defer conn.Close()
-       if err != nil {
-           fmt.Println("Error accepting", err.Error())
-           return
-       }
-       go bgp.DoServerStuff(conn)
-    }
-   }
-
-
-func (bgp *BGP) SendToPeer(peerIp string,peerPort int,asPathContent string)  {
-    peerAdress := fmt.Sprintf("%s:%d", peerIp, peerPort)
-    conn, err := net.Dial("tcp", peerAdress)
-    //defer conn.Close()
-    if err != nil {
-        fmt.Println("发送失败", err.Error())
-        return
-    }
-
-    _, err = conn.Write([]byte(asPathContent))
-    conn.Close()
-    return
-
-}
+var AllPortMap sync.Map
+var AllIpMap sync.Map
+var globalPeerInfo  sync.Map
+var globalSendPeerMap sync.Map
 
 
 
 
-func externalIP() (net.IP, error) {
-    ifaces, err := net.Interfaces()
-    if err != nil {
-        return nil, err
-    }
-    for _, iface := range ifaces {
-        if iface.Flags&net.FlagUp == 0 {
-            continue // interface down
-        }
-        if iface.Flags&net.FlagLoopback != 0 {
-            continue // loopback interface
-        }
-        addrs, err := iface.Addrs()
-        if err != nil {
-            return nil, err
-        }
-        for _, addr := range addrs {
-            ip := getIpFromAddr(addr)
-            if ip == nil {
-                continue
-            }
-            return ip, nil
-        }
-    }
-    return nil, errors.New("connected to the network?")
-}
 
-func InitMySqlParameter(user, password, server, database string) (engine *xorm.Engine, err error) {
-	openSql := user + ":" + password + "@tcp(" + server + ")/" + database + "?charset=utf8&parseTime=True&loc=Local"
-	engine, err = xorm.NewEngine("mysql", openSql)
-	if err != nil {
-		fmt.Println("NewEngine err",err)
-		return engine, err
-	}
-	engine.SetTableMapper(core.SnakeMapper{})
-	return engine, nil
-}
+func GetPortAndIpMap()(AllPortMap ,AllIpMap,globalPeerInfo,globalSendPeerMap sync.Map){
 
-
-func getIpFromAddr(addr net.Addr) net.IP {
-    var ip net.IP
-    switch v := addr.(type) {
-    case *net.IPNet:
-        ip = v.IP
-    case *net.IPAddr:
-        ip = v.IP
-    }
-    if ip == nil || ip.IsLoopback() {
-        return nil
-    }
-    ip = ip.To4()
-    if ip == nil {
-        return nil // not an ipv4 address
-    }
-
-    return ip
-}
-
-func InitMysql()  {
-	user := "root"
-	password := "Rpstir-123"
-	server := "202.173.14.103:23306"
-	database := "bgp_exp"
-	XormEngine, _ = InitMySqlParameter(user, password, server, database)
-}
-func GetFreePorts(count int) ([]int, error) {
-   var ports []int
-
-   m := make(map[int]bool) //map的值不重要
-
-   for{
-   	   	l, _ := net.Listen("tcp", ":0")
-   	   	defer l.Close()
-   	   	port := l.Addr().(*net.TCPAddr).Port
-		if _, ok := m[port]; !ok{
-			   ports = append(ports, port)
-			   m[port] = true
-		}
-		if len(ports) >=count{
-			break
-		}
-   }
-
-   //
-   //
-   //for i := 0; i < count; i++ {
-   //    //addr, _ := net.ResolveTCPAddr("tcp", "localhost:0")
-   //    //l, _ := net.ListenTCP("tcp", addr)
-   //    //fmt.Printn("端口空闲",i,l.Addr().(*net.TCPAddr).Port)
-   //    //defer l.Close()
-   //	   	l, _ := net.Listen("tcp", ":0")
-   //	   	defer l.Close()
-   //	   	port := l.Addr().(*net.TCPAddr).Port
-   //		fmt.Println(port,i)
-   //    ports = append(ports, port)
-   //}
-   return ports, nil
-}
-
-func GetPortAndIpMap()(ipPost map[string] string,portMap map[string] int){
-
-	portMap = make(map[string] int)
-	ipPost = make(map[string] string)
 	sql := `SELECT * FROM as_distribution_info`
-	var As_distribution_infos []As_distribution_info
-	err := XormEngine.SQL(sql).Find(&As_distribution_infos)
+	var As_distribution_infos []model.As_distribution_info
+	err := model.XormEngine.SQL(sql).Find(&As_distribution_infos)
 	if err != nil{
 		fmt.Println("get As_distribution_infos err:",err)
 	}
 	for _,value := range As_distribution_infos{
-		portMap[value.Name] = value.Tcp_port
-		ipPost[value.Name] = value.Ip
+		var as_peer []model.As_peer
+		err:=json.Unmarshal([]byte(value.Peer),&as_peer)
+		if err != nil{
+			fmt.Println(err)
+		}
+		//peer_map := make(map[string]map[string]int)
+		var peer_map sync.Map
+		var globalSendPeerList []string
+		for _,peer_value := range as_peer{
+			peer_in_out_map := make(map[string]int)
+			peer_in_out_map["in"] = peer_value.In
+			peer_in_out_map["out"] = peer_value.Out
+			peer_map.Store(peer_value.Name,peer_in_out_map)
+			peerNum, _ := strconv.Atoi(peer_value.Name[2:])
+			selfNum, _ := strconv.Atoi(value.Name[2:])
+			if peerNum > selfNum{
+				globalSendPeerList = append(globalSendPeerList, peer_value.Name)
+			}
+		}
+		globalSendPeerMap.Store(value.Name,globalSendPeerList)
+		globalPeerInfo.Store(value.Name,peer_map)
+		AllPortMap.Store(value.Name,value.Tcp_port)
+		AllIpMap.Store(value.Name,value.Ip)
 	}
 	return
 }
 
 
 
-
-func main() {
-	time.Sleep(time.Duration(10)*time.Second)
-	InitMysql()
-	defer XormEngine.Close()
-	ip, err := externalIP()
+func distribution()(As_distribution_infos []model.As_distribution_info,as_distribution_done model.As_distribution_done){
+	ip, err := model.ExternalIP()
 	if err != nil{
 		fmt.Println("getIP err:",err)
 	}
@@ -300,11 +98,10 @@ func main() {
 	if err != nil{
 		fmt.Println("getIP err:",err)
 	}
-	//name := "c1ad44d8c58a"
 	fmt.Println("ip：",ip.String(),"name,",name)
 
 
-	session := XormEngine.NewSession()
+	session := model.XormEngine.NewSession()
 	if err := session.Begin(); err != nil {
 		session.Rollback()
 		fmt.Println(session, "session.Begin() fail", err)
@@ -315,7 +112,7 @@ func main() {
 	//得到所有记录的长度
 	var asLength int
 	sql := `select count(id) as asLength from as_distribution_info `
-	_, err = XormEngine.SQL(sql).Get(&asLength)
+	_, err = model.XormEngine.SQL(sql).Get(&asLength)
 	if err != nil{
 		fmt.Println("getAllLength err:",err)
 	}
@@ -323,15 +120,15 @@ func main() {
 	//得到容器个数
 	var containerNum int
 	sql = `select count(id) as containerNum from as_distribution_done `
-	_, err = XormEngine.SQL(sql).Get(&containerNum)
+	_, err = model.XormEngine.SQL(sql).Get(&containerNum)
 	if err != nil{
 		fmt.Println("get container Length err:",err)
 	}
 	fmt.Println("containerNum:,",containerNum)
 	//得到自己的序号
-	as_distribution_done := As_distribution_done{}
+	as_distribution_done = model.As_distribution_done{}
 	sql = `select * from as_distribution_done `
-	_, err = XormEngine.Table("as_distribution_done").Where(" container_name = ?",name).Get(&as_distribution_done)
+	_, err = model.XormEngine.Table("as_distribution_done").Where(" container_name = ?",name).Get(&as_distribution_done)
 	if err != nil{
 		fmt.Println("get As_distribution_done err:",err)
 	}
@@ -341,75 +138,183 @@ func main() {
 	startIndex := perCount*(as_distribution_done.Container_num)
 	sql = `SELECT * FROM as_distribution_info order by id asc LIMIT ?,?`
 	fmt.Println("sql:",sql,"startindex",startIndex,"perCount",perCount)
-	var As_distribution_infos []As_distribution_info
-	err = XormEngine.SQL(sql,startIndex,perCount).Find(&As_distribution_infos)
+	err = model.XormEngine.SQL(sql,startIndex,perCount).Find(&As_distribution_infos)
 	if err != nil{
 		fmt.Println("get As_distribution_infos err:",err)
 	}
 	fmt.Println("计算得到分区，分区数量",len(As_distribution_infos))
-	freePort,err := GetFreePorts(len(As_distribution_infos))
+	freePort,err := model.GetFreePorts(len(As_distribution_infos))
 	fmt.Println("计算得到分区，端口数量",len(freePort))
 	for index,_ := range As_distribution_infos{
 		As_distribution_infos[index].Tcp_port = freePort[index]
 		As_distribution_infos[index].Ip = ip.String()
 		As_distribution_infos[index].Container_name = name
+
 		//fmt.Println("更新,",As_distribution_infos[index])
-		XormEngine.Table("as_distribution_info").ID(As_distribution_infos[index].Id).Update(&As_distribution_infos[index])
+		model.XormEngine.Table("as_distribution_info").ID(As_distribution_infos[index].Id).Update(&As_distribution_infos[index])
 	}
+
+
 	fmt.Println("分区ip端口更新完毕")
 	as_distribution_done.Distribution_done = 1
 	as_distribution_done.Ip = ip.String()
 
-	XormEngine.Table("as_distribution_done").ID(as_distribution_done.Id).Update(&as_distribution_done)
+	model.XormEngine.Table("as_distribution_done").ID(as_distribution_done.Id).Update(&as_distribution_done)
 	fmt.Println(as_distribution_done)
 
 	err = session.Commit()
 	if err != nil{
 		fmt.Println("commit err:",err)
 	}
+	return
+}
+
+
+
+
+func main() {
+	model.InitMysql()
+	defer model.XormEngine.Close()
+
+	As_distribution_infos ,as_distribution_done:= distribution()
+
 
 	for {
 		var undoneCount int
-		sql = `select count(id) as undoneCount from as_distribution_done where  distribution_done = ?`
-		_, err = XormEngine.SQL(sql,0).Get(&undoneCount)
+		sql := `select count(id) as undoneCount from as_distribution_done where  distribution_done = ?`
+		_, err := model.XormEngine.SQL(sql,0).Get(&undoneCount)
+		if err!=nil{
+			fmt.Println(err)
+		}
 		if undoneCount == 0{
 			break
 		}
 		time.Sleep(time.Duration(1)*time.Second)
 	}
+
+
+
 	//portMap,inDegreeMap,outDegreeMap := GetPortAndDegree()
-	AllIpMap,AllPortMap = GetPortAndIpMap()
+	AllPortMap ,AllIpMap,globalPeerInfo,globalSendPeerMap = GetPortAndIpMap()
 	fmt.Println("ip和端口拉取完毕")
 
-	globalServer = make(chan int,1)
-    globalServer<- 0
+	//globalServer = make(chan int,1)
+    //globalServer<- 0
+    globalDeployServerNum = 0
+    globalConnectServerNum = 0
+    var connectServerNum = 0
+    //globalDoneServer = make(chan int,1)
+    //globalDoneServer<- len(freePort)
 
+    globalDoneServerNum = int32(len(As_distribution_infos))
+
+	var bgpList [] *model.BGP
     wg := &sync.WaitGroup{}
 	for _,value := range As_distribution_infos{
 		wg.Add(1)
-		sendNum := make(chan int,1)
-        sendNum <-value.Out_degree
-        receiveNum := make(chan int,1)
-        receiveNum <- value.In_degree
-		go (&BGP{port: value.Tcp_port,name: value.Name,processDone: make(chan bool),sendNum: sendNum,receiveNum: receiveNum}).ServerStart(wg)
+		//sendNum := make(chan int,1)
+      //sendNum <-value.Out_degree
+      //receiveNum := make(chan int,1)
+      //receiveNum <- value.In_degree
+		sendNum := int32(value.Out_degree)
+		receiveNum := int32(value.In_degree)
+		peer,_ := globalPeerInfo.Load(value.Name)
+		sendConn ,_ := globalSendPeerMap.Load(value.Name)
+		if len(sendConn.([]string)) >0{
+			connectServerNum += 1
+		}
+		bgp := &model.BGP{
+			Port: value.Tcp_port,
+			Name: value.Name,
+			ProcessDone: make(chan bool),
+			ConnectionDone : make(chan bool),
+			SendNum: sendNum,
+			ReceiveNum: receiveNum,
+			Peer: peer.(sync.Map),
+			SendConn: sendConn.([]string),
+			SendConnNum: int32(len(sendConn.([]string))),
+			GlobalIpMap: AllIpMap,
+			GlobalPortMap: AllPortMap,
+			}
+		bgpList = append(bgpList,bgp)
+		go bgp.ServerStart(wg,&globalDeployServerNum ,&globalConnectServerNum,&globalDoneServerNum)
 	}
 	allServerNum := len(As_distribution_infos)
 	for {
-        serverNum := <- globalServer
-        globalServer<-serverNum
-        if serverNum == allServerNum{
-        	as_distribution_done.Deployment_done = 1
-			XormEngine.Table("as_distribution_done").ID(as_distribution_done.Id).Update(&as_distribution_done)
-        	fmt.Println("server部署完毕")
-            break
+      //serverNum := <- globalServer
+      //globalServer<-serverNum
+      serverNum := int(atomic.LoadInt32(&globalDeployServerNum))
+      if serverNum == allServerNum{
+      	as_distribution_done.Deployment_done = 1
+			model.XormEngine.Table("as_distribution_done").ID(as_distribution_done.Id).Update(&as_distribution_done)
+      		fmt.Println("server部署完毕")
+          break
 		}
     }
 
+for {
+		var deploymentUndoneCount int
+		sql := `select count(id) as deploymentUndoneCount from as_distribution_done where  deployment_done = ?`
+		_, err := model.XormEngine.SQL(sql,0).Get(&deploymentUndoneCount)
+		if err != nil{
+			fmt.Println("get deploymentUndoneCount err:",err)
+		}
+		if deploymentUndoneCount == 0{
+			break
+		}
+		time.Sleep(time.Duration(1)*time.Second)
+	}
+	fmt.Println("server分发部署完毕，开始连接")
+    for _,bgp_value := range bgpList{
+    	go bgp_value.EchoConncttion()
+	}
+
+	for {
+      serverConnectionNum := int(atomic.LoadInt32(&globalConnectServerNum))
+      if serverConnectionNum == connectServerNum{
+      	as_distribution_done.Connection_done = 1
+			model.XormEngine.Table("as_distribution_done").ID(as_distribution_done.Id).Update(&as_distribution_done)
+      		fmt.Println("server连接建立完毕")
+          break
+		}
+    }
+
+
+
+	go func() {
+		for{
+		   //serverNum := <- globalDoneServer
+		   //globalDoneServer <- serverNum
+
+		   serverNum := atomic.LoadInt32(&globalDoneServerNum)
+		   if serverNum > 0{
+			fmt.Println("收敛余额：",serverNum)
+			}else{
+				break
+			}
+			time.Sleep(time.Duration(5)*time.Second)
+		}
+	}()
+
     wg.Wait()
 	as_distribution_done.Convergence_done = 1
-	XormEngine.Table("as_distribution_done").ID(as_distribution_done.Id).Update(&as_distribution_done)
+	model.XormEngine.Table("as_distribution_done").ID(as_distribution_done.Id).Update(&as_distribution_done)
+	fmt.Println("收敛")
 
+	for {
+		var convergenceUndoneCount int
+		sql := `select count(id) as convergenceUndoneCount from as_distribution_done where  convergence_done = ?`
+		_, err := model.XormEngine.SQL(sql,0).Get(&convergenceUndoneCount)
+		if err != nil{
+			fmt.Println("get convergenceUndoneCount err:",err)
+		}
+		if convergenceUndoneCount == 0{
+			break
+		}
+		time.Sleep(time.Duration(2)*time.Second)
+		fmt.Println("等待全局收敛" )
 
-
+	}
+    fmt.Println("全局收敛")
 
 }

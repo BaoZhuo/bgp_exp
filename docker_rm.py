@@ -1,6 +1,6 @@
 import subprocess
 
-num = 2
+num = 50
 
 
 

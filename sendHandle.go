@@ -18,6 +18,8 @@ import (
 )
 var fileName = flag.String("fileName", "", "文件路径")
 var XormEngine = &xorm.Engine{}
+var HandleServerMap map[string]*HandleServer
+
 
 type As_distribution_done struct {
 	Id           int `json:"id" xorm:"id int pk autoincr"`
@@ -46,14 +48,46 @@ type Handle struct {
     //sendNumMap map[string] int
     //receiveNumMap map[string] int
 }
+
+type HandleServer struct{
+	Address string
+	asPathContents []string
+	Conn net.Conn
+}
+
+func (handleServer *HandleServer)  NewClient2StartServer (wg *sync.WaitGroup,asPathContent string){
+	defer wg.Done()
+	fmt.Println("发送",asPathContent)
+	handleServer.Conn.Write([]byte(asPathContent))
+	return
+}
+
+func (handleServer *HandleServer)  NewClient2StartServers (wg *sync.WaitGroup){
+	defer wg.Done()
+	conn, err := net.Dial("tcp", handleServer.Address)
+	if err != nil {
+       fmt.Println("--------------------Error dialing", err.Error(),handleServer.Address)
+       return // 终止程序
+	}
+	contents := ""
+	for _,value := range handleServer.asPathContents{
+		contents = contents + value + "@"
+	}
+	fmt.Println("发送",contents)
+	conn.Write([]byte("##"+contents))
+	return
+}
+
+
 func (handle *Handle) NewClient(wg *sync.WaitGroup,asPathContent string,port int,ip string)  {
     defer wg.Done()
     address := fmt.Sprintf("%s:%d",ip,port)
-    conn, err := net.Dial("tcp", address)
-    if err != nil {
-        fmt.Println("--------------------Error dialing", err.Error(),address)
-        return // 终止程序
-    }
+	conn, err := net.Dial("tcp", address)
+	if err != nil {
+       fmt.Println("--------------------Error dialing", err.Error(),address)
+       return // 终止程序
+	}
+    defer conn.Close()
     _, err = conn.Write([]byte(asPathContent))
     return
 }
@@ -72,9 +106,35 @@ func (handle *Handle) Start(Wg *sync.WaitGroup)  {
         startAs := handle.GetStartAs(value)
         port := handle.portMap[startAs]
         ip := handle.ipMap[startAs]
-        wg.Add(1)
-        go handle.NewClient(wg,value,port,ip)
+
+
+        address := fmt.Sprintf("%s:%d",ip,port)
+	    var handleServer *HandleServer
+        if _, ok := HandleServerMap[address]; !ok {
+        	handleServer = &HandleServer{Address: address}
+        	handleServer.asPathContents = append(handleServer.asPathContents,value)
+        	HandleServerMap[address] = handleServer
+		}else{
+			handleServer = HandleServerMap[address]
+			handleServer.asPathContents = append(handleServer.asPathContents,value)
+        	HandleServerMap[address] = handleServer
+		}
+		//time.Sleep(time.Duration(500)*time.Microsecond)
+		//time.Sleep(time.Duration(50)*time.Millisecond)
+		//go handleServer.NewClient2StartServers(wg)
+
+
+
+		//
+        //go handle.NewClient(wg,value,port,ip)
     }
+
+    for index,_  := range HandleServerMap{
+    	wg.Add(1)
+    	handelServer := HandleServerMap[index]
+    	//time.Sleep(time.Duration(10000)*time.Millisecond)
+    	go handelServer.NewClient2StartServers(wg)
+	}
     wg.Wait()
 }
 func InitMysql()  {
@@ -141,7 +201,8 @@ func GetAsPathContens()(asPathcontent []string){
 }
 
 func main(){
-	time.Sleep(time.Duration(10)*time.Second)
+	flag.Parse()
+	fmt.Println("文件：",*fileName)
 	InitMysql()
 	defer XormEngine.Close()
 	for {
@@ -155,9 +216,11 @@ func main(){
 			break
 		}
 		time.Sleep(time.Duration(1)*time.Second)
+		fmt.Println("等待部署完毕")
 	}
     portMap,ipMap := GetPortMap()
     asPathcontents := GetAsPathContens()
+    HandleServerMap = make(map[string]*HandleServer)
     fmt.Println("AS个数，",len(portMap),"发包长度，",len(asPathcontents))
 	wg := &sync.WaitGroup{}
 	handle := &Handle{asPathContents:asPathcontents,portMap : portMap,ipMap: ipMap}
@@ -175,10 +238,38 @@ func main(){
 		}
 		time.Sleep(time.Duration(1)*time.Second)
 	}
-	fmt.Println("server分发并部署完毕，开始")
+	fmt.Println("server分发部署完毕，开始")
+		for {
+		var connectionUndoneCount int
+		sql := `select count(id) as connectionUndoneCount from as_distribution_done where  connection_done = ?`
+		_, err := XormEngine.SQL(sql,0).Get(&connectionUndoneCount)
+		if err != nil{
+			fmt.Println("get deploymentUndoneCount err:",err)
+		}
+		if connectionUndoneCount == 0{
+			break
+		}
+		time.Sleep(time.Duration(1)*time.Second)
+	}
+	fmt.Println("server分发部署连接完毕，开始")
+
 	start := time.Now()
-    handle.Start(wg)
+    go handle.Start(wg)
     wg.Wait()
+	for {
+		var convergenceUndoneCount int
+		sql := `select count(id) as convergenceUndoneCount from as_distribution_done where  convergence_done = ?`
+		_, err := XormEngine.SQL(sql,0).Get(&convergenceUndoneCount)
+		if err != nil{
+			fmt.Println("get convergenceUndoneCount err:",err)
+		}
+		if convergenceUndoneCount == 0{
+			break
+		}
+		time.Sleep(time.Duration(2)*time.Second)
+		fmt.Println("等待全局收敛，耗时：", time.Since(start))
+
+	}
     fmt.Println("全局收敛")
     elapsed := time.Since(start)
     fmt.Println("收敛完成耗时：", elapsed)
